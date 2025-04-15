@@ -3,13 +3,28 @@
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\APIController;
+use App\Events\NewMessage;
+use App\Models\Message;
+use Illuminate\Support\Facades\Auth;
+use Ably\AblyRest;
 
+// routes/web.php
 Route::post('/register', [APIController::class, 'register']);
 Route::post('/login', [APIController::class, 'login']);
+Route::post('/generate-otp', [APIController::class, 'generateOtp']);
+Route::post('/reset-password-with-otp', [APIController::class, 'resetPasswordWithOtp']);
 
-Route::get('/users', [APIController::class, 'users'])->middleware('auth:sanctum');
+
+
 
 Route::middleware(['auth:sanctum'])->group(function () {
+    Route::get('/users', [APIController::class, 'getUserNames']);
+   Route::get('/fetch-messages/{channelName}', [APIController::class, 'fetchMessages']);
+   Route::delete('/user', [APIController::class, 'deleteUser']);
+   Route::put('/update', [APIController::class, 'updateProfileImage']);
+
+
+   
     Route::get('/user-profile', [APIController::class, 'getWalkingUserProfileView']);
     Route::delete('/pigeon', [APIController::class, 'deletePigeon']);
 
@@ -60,11 +75,13 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::get('/user-details', [APIController::class, 'userDetails'])->name('user-details');
     Route::get('/users/messages', [APIController::class, 'getUserMessages']);
     Route::post('/send-message', [APIController::class, 'sendMessage']);
-    Route::get('/messages', [APIController::class, 'getMessages']);
+     Route::get('/messages', [APIController::class, 'getMessages']);
     Route::post('/notifications', [APIController::class, 'createNotification']);
     Route::put('/mark-read', [APIController::class, 'markAsRead']);
     Route::get('/notifications', [APIController::class, 'getUnreadNotifications']); 
+    Route::get('/pigeonnames', [APIController::class, 'getPigeonNames']);
     Route::post('/clubscore', [APIController::class, 'addClubScore']);
+
     
     Route::group(['as' => "club-", 'prefix' => 'club'], function () {
         Route::get('/all', [APIController::class, 'getAllClubs'])->name('all');
@@ -78,6 +95,5 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::post('/add-club-posts', [APIController::class, 'createClubPost'])->name('add-club-posts');
         Route::get('/terms-joining-fee', [APIController::class, 'getClubTermsAndJoiningFee'])->name('terms-joining-fee');
         Route::get('/pending-requests', [APIController::class, 'getPendingRequests'])->name('pending-requests');
-       
     });
 });
