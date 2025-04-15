@@ -13,6 +13,11 @@ use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Broadcast;
 use Symfony\Component\HttpFoundation\StreamedResponse;
+use Carbon\Carbon;
+use App\Services\AblyService;
+use Ably\AblyRest;
+use Throwable;
+
 
 
 //models
@@ -32,8 +37,10 @@ use App\Models\Review;
 use App\Models\Comment;
 use App\Models\Message;
 use App\Models\Notification;
+use App\Models\ClubScore;
+use App\Mail\SendOtpMail;
 
-use App\Events\NewMessage;
+
 
 class APIController extends Controller
 {
@@ -52,10 +59,14 @@ class APIController extends Controller
         // Generate token
         $token = $user->createToken('auth_token')->plainTextToken;
 
-        // Return response with user ID and token
+        // Generate URL for profile image using Storage facade
+        $profileImageUrl = Storage::disk('public')->url('uploads/' . $user->profile_image);
+
+        // Return response with user ID, profile image URL, and token
         return response()->json([
             'status' => 'success',
-            'user_id' => $user->id, // Include user_id in the response
+            'user_id' => $user->id,
+            'profile_image' => $profileImageUrl,
             'access_token' => $token,
             'token_type' => 'Bearer',
         ]);
@@ -68,15 +79,10 @@ class APIController extends Controller
 }
 
 
-    public function users(Request $request){
 
-        $user = User::all();
-        return response()->json([
-            'users' => $user,
-        ]);
-    }
 
-    public function register(Request $request) {
+
+  public function register(Request $request) {
         try {
             $validator = Validator::make($request->all(), [
                 'email' => 'unique:users',
@@ -120,9 +126,74 @@ class APIController extends Controller
             ], 500);
         }
     }
+    
+    public function generateOtp(Request $request)
+{
+    try {
+        // Validate the request
+        $validator = Validator::make($request->all(), [
+            'email' => 'required|email|exists:users,email',
+        ]);
+        if ($validator->fails()) {
+            Log::warning('Validation failed', ['errors' => $validator->errors()->toArray()]);
+            return response()->json(['errors' => $validator->errors()], 400);
+        }
+
+        // Generate a 6-digit OTP
+        $otp = rand(100000, 999999);
+        $expiresAt = Carbon::now()->addMinutes(10);
+
+        // Store OTP in database (or cache)
+        DB::table('password_resets')->updateOrInsert(
+            ['email' => $request->email],
+            ['otp' => $otp, 'expires_at' => $expiresAt]
+        );
+
+        // Send the OTP email
+        try {
+            Mail::to($request->email)->send(new SendOtpMail($otp));
+            Log::info('OTP generated and email sent', ['email' => $request->email, 'otp' => $otp]);
+        } catch (\Exception $e) {
+            Log::error('Failed to send OTP email', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+            return response()->json(['error' => 'Failed to send OTP email', 'message' => $e->getMessage()], 500);
+        }
+
+        return response()->json(['status' => 'success', 'message' => 'OTP generated successfully', 'otp' => $otp], 200);
+    } catch (\Exception $e) {
+        Log::error('Failed to generate OTP', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+        return response()->json(['error' => 'Failed to generate OTP', 'message' => $e->getMessage()], 500);
+    }
+}
+
+    public function resetPasswordWithOtp(Request $request)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'email' => 'required|email|exists:users,email',
+                'otp' => 'required|numeric',
+                'password' => 'required|confirmed|min:6',
+            ]);
+            if ($validator->fails()) {
+                return response()->json(['errors' => $validator->errors()], 400);
+            }
+            // Verify OTP
+            $record = DB::table('password_resets')->where('email', $request->email)->first();
+            if (!$record || $record->otp != $request->otp || Carbon::now()->isAfter($record->expires_at)) {
+                return response()->json(['error' => 'Invalid or expired OTP'], 400);
+            }
+            // Update password
+            $user = User::where('email', $request->email)->first();
+            $user->update(['password' => Hash::make($request->password)]);
+            // Delete OTP record
+            DB::table('password_resets')->where('email', $request->email)->delete();
+            return response()->json(['status' => 'success','message' => 'Password reset successfully'], 200);
+        } catch (\Exception $e) {
+            return response()->json(['error' => 'Failed to reset password', 'message' => $e->getMessage()], 500);
+        }
+    }
 
     // pigeon apis
-   public function getAllPigeons(Request $request) {
+ public function getAllPigeons(Request $request) {
     try {
         $user = $request->user();
         $search = $request->query('search');
@@ -142,15 +213,16 @@ class APIController extends Controller
             );
 
         if (!empty($search)) {
-    $query->where(function ($q) use ($search) {
-        $terms = explode('&', $search); // Split search terms by '&'
-        foreach ($terms as $term) {
-            $trimmedTerm = trim($term); // Trim spaces around the term
-            $q->orWhere('pigeons.name', 'LIKE', '%' . $trimmedTerm . '%')
-              ->orWhere('users.name', 'LIKE', '%' . $trimmedTerm . '%');
+            $query->where(function ($q) use ($search) {
+                $terms = explode('&', $search); // Split search terms by '&'
+                foreach ($terms as $term) {
+                    $trimmedTerm = trim($term); // Trim spaces around the term
+                    $q->orWhere('pigeons.name', 'LIKE', '%' . $trimmedTerm . '%')
+                      ->orWhere('users.name', 'LIKE', '%' . $trimmedTerm . '%');
+                }
+            });
         }
-     });
-   }
+
         $pigeons = $query->orderBy('pigeons.created_at', 'desc')->get();
 
         foreach ($pigeons as $pigeon) {
@@ -173,6 +245,14 @@ class APIController extends Controller
                 ->where('followed_by', $user->id)
                 ->first();
             $pigeon->user_follow_text = !empty($follower) ? "Following" : "Follow";
+
+            // Check if the current user liked the pigeon
+            $liked = DB::table('pigeon_user_actions')
+                ->where('user_id', $user->id)
+                ->where('pigeon_id', $pigeon->id)
+                ->where('liked', 1)
+                ->exists();
+            $pigeon->isLiked = $liked;
         }
 
         return response()->json([
@@ -186,6 +266,7 @@ class APIController extends Controller
         ], 500);
     }
 }
+
 
 
     
@@ -287,36 +368,51 @@ class APIController extends Controller
         }
     }
 
-    public function getAllShops(Request $request){
+    public function getAllShops(Request $request)
+{
+    try {
+        $search = $request->query('search');
 
-        try{
-            $search = $request->query('search');
-            if(!empty($search)){
-                $shops = Shops::join('users', 'shops.user_id', '=', 'users.id')
-                    ->where('shops.shop_name', 'LIKE', '%'.$search.'%')
-                    ->select('shops.id', 'shop_name', 'category', 'users.name as owner_name','users.created_at as member_since', 'image')
-                    ->orderBy('shops.created_at', 'desc')
-                    ->get();
-            }else{
-                $shops = Shops::join('users', 'shops.user_id', '=', 'users.id')
-                    ->select('shops.id', 'shop_name', 'category', 'users.name as owner_name','users.created_at as member_since', 'image')
-                    ->orderBy('shops.created_at', 'desc')
-                    ->get();
-            }
-            foreach($shops as $shop){
-                $shop->image = Storage::disk('public')->url('uploads/'.$shop->image);
-            }
-            return response()->json([
-                'status' => 'success',
-                'data'   => $shops,
-            ], 200);
-        }catch (Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => $e->getMessage(),
-            ], 500);
+        $query = Shops::join('users', 'shops.user_id', '=', 'users.id')
+            ->select(
+                'shops.id',
+                'user_id',
+                'shop_name',
+                'category',
+                'users.name as owner_name',
+                'users.created_at as member_since',
+                'users.address',
+                'users.phone',
+                'image'
+            )
+            ->orderBy('shops.created_at', 'desc');
+
+        if (!empty($search)) {
+            $query->where(function ($q) use ($search) {
+                $q->where('shops.shop_name', 'LIKE', '%' . $search . '%')
+                  ->orWhere('shops.category', 'LIKE', '%' . $search . '%');
+            });
         }
+
+        $shops = $query->get();
+
+        foreach ($shops as $shop) {
+            $shop->image = Storage::disk('public')->url('uploads/' . $shop->image);
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'data'   => $shops,
+        ], 200);
+    } catch (Exception $e) {
+        return response()->json([
+            'status' => 'error',
+            'message' => $e->getMessage(),
+        ], 500);
     }
+}
+
+
 
     public function getShopByID(Request $request, $id){
 
@@ -655,6 +751,7 @@ public function getAllProductsByShop(Request $request)
             return response()->json([
                 'status' => 'success',
                 'message' => 'Like already recorded.',
+                'isLiked' => true,
             ]);
         }
 
@@ -681,6 +778,7 @@ public function getAllProductsByShop(Request $request)
         return response()->json([
             'status' => 'success',
             'message' => 'Like count updated successfully.',
+            'isLiked' => true,
         ]);
     } catch (\Exception $e) {
         \Log::error('Error in likePigeonPost API: ' . $e->getMessage(), [
@@ -692,6 +790,7 @@ public function getAllProductsByShop(Request $request)
         ], 500);
     }
 }
+
 
 public function viewPigeonPost(Request $request)
 {
@@ -770,13 +869,11 @@ public function viewPigeonPost(Request $request)
                 'created_at as member_since'
             )
             ->first();
-
-        // Handle profile image URL
+            
         if (!empty($user_detail->profile_image)) {
             $user_detail->profile_image = Storage::disk('public')->url('uploads/' . $user_detail->profile_image);
         }
 
-        // Fetch user's pigeons (posts)
         $user_detail->posts = Pigeons::where('user_id', $user->id)
             ->select('name', 'created_at as post_date')
             ->get();
@@ -799,8 +896,11 @@ public function viewPigeonPost(Request $request)
         $user_detail->following = followers::where('following', $user->id)->count(); // Count of users following this user
         $user_detail->followers = followers::where('followed_by', $user->id)->count(); // Count of users this user is following
 
-        // Add static club score, rank, and rating
-        $user_detail->club_score = 15;
+        // Fetch club_score dynamically from clubscore table
+        // Fetch club_score dynamically and ensure it is an integer
+       $user_detail->club_score = (int) ClubScore::where('user_id', $user->id)->sum('club_score');
+
+        // Keep other values hardcoded
         $user_detail->club_rank = 15;
         $user_detail->rating = 4;
 
@@ -818,42 +918,44 @@ public function viewPigeonPost(Request $request)
 
 
 
+
     // clubs api
-    public function createClub(Request $request){
-        try{
-            $user = $request->user();
-            $fileName = "";
-            if($request->club_image){
-                $file = base64_decode($request->club_image);
-                $fileName = time() . '.png';
-                Storage::disk('public')->put('uploads/' . $fileName, $file);
-            }
-            $club = Clubs::create([
-                "club_name" => $request->club_name,
-                "president_name" => $request->president_name,
-                "club_image" => $fileName,
-                "country_flag" => $request->country_flag,
-                "terms_&_conditions" => $request->input('terms_&_conditions'), 
-                "joining_fee" => $request->joining_fee,
-            ]);
-            ClubMembers::create([
-                'user_id' => $user->id,
-                'club_id' => $club->id,
-                'role'    => 'president',
-                'request_approved' => true // president will join automatically
-            ]);
-            return response()->json([
-                'status' => 'success',
-                'message' => 'Club created successfully!',
-            ], 200);
-        }catch (Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => $e->getMessage(),
-            ], 500);
+ public function createClub(Request $request) {
+    try {
+        $fileName = "";
+
+        if ($request->club_image) {
+            $file = base64_decode($request->club_image);
+            $fileName = time() . '.png';
+            Storage::disk('public')->put('uploads/' . $fileName, $file);
         }
+
+        $club = Clubs::create([
+            "user_id" => $request->user_id, 
+            "club_name" => $request->club_name,
+            "president_name" => $request->president_name,
+            "president_account_number" => $request->president_account_number,
+            "bank_name" => $request->bank_name,
+            "club_image" => $fileName,
+            "country_flag" => $request->country_flag,
+           "terms_&_conditions" => $request->all()['terms_&_conditions'] ?? null,
+            "joining_fee" => $request->joining_fee,
+            "role" => 'president' // Set role as 'president' by default
+        ]);
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Club created successfully!',
+        ], 200);
+    } catch (Exception $e) {
+        return response()->json([
+            'status' => 'error',
+            'message' => $e->getMessage(),
+        ], 500);
     }
-    
+}
+
+
 
     public function getAllClubs(Request $request){
 
@@ -885,42 +987,60 @@ public function viewPigeonPost(Request $request)
         }
     }
 
-    public function getAllMembersOfClub(Request $request, $id){
+   public function getAllMembersOfClub(Request $request, $id)
+{
+    try {
+        $search = $request->query('search');
 
-        try{
-            $search = $request->query('search');
-            if(!empty($search)){
-                $members = ClubMembers::join('users', 'club_members.user_id', '=', 'users.id')
-                    ->select('users.id as user_id', 'users.profile_image as user_image', 'users.created_at as member_since', 'users.name as user_name', 'club_members.role')
-                    ->where('club_members.club_id', $id)
-                    ->where('club_members.request_approved', true)
-                    ->where('users.name', 'LIKE', '%'.$search.'%')
-                    ->orderBy('club_members.created_at', 'desc')
-                    ->get();
-            }else{
-                $members = ClubMembers::join('users', 'club_members.user_id', '=', 'users.id')
-                    ->select('users.id as user_id', 'users.profile_image as user_image', 'users.created_at as member_since', 'users.name as user_name', 'club_members.role')
-                    ->where('club_members.club_id', $id)
-                    ->where('club_members.request_approved', true)
-                    ->orderBy('club_members.created_at', 'desc')
-                    ->get();
-            }
-            foreach($members as $member){
-                if(!empty($member->user_image)){
-                    $member->user_image = Storage::disk('public')->url('uploads/'.$member->user_image);
-                }
-            }
-            return response()->json([
-                'status' => 'success',
-                'data'   => $members,
-            ], 200);
-        }catch (Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => $e->getMessage(),
-            ], 500);
+        if (!empty($search)) {
+            $members = ClubMembers::join('users', 'club_members.user_id', '=', 'users.id')
+                ->select(
+                    'club_members.id as club_member_id', // Added club_members.id
+                    'users.id as user_id',
+                    'users.profile_image as user_image',
+                    'users.created_at as member_since',
+                    'users.name as user_name',
+                    'club_members.role'
+                )
+                ->where('club_members.club_id', $id)
+                ->where('club_members.request_approved', true)
+                ->where('users.name', 'LIKE', '%' . $search . '%')
+                ->orderBy('club_members.created_at', 'desc')
+                ->get();
+        } else {
+            $members = ClubMembers::join('users', 'club_members.user_id', '=', 'users.id')
+                ->select(
+                    'club_members.id as id', // Added club_members.id
+                    'users.id as user_id',
+                    'users.profile_image as user_image',
+                    'users.created_at as member_since',
+                    'users.name as user_name',
+                    'club_members.role'
+                )
+                ->where('club_members.club_id', $id)
+                ->where('club_members.request_approved', true)
+                ->orderBy('club_members.created_at', 'desc')
+                ->get();
         }
+
+        foreach ($members as $member) {
+            if (!empty($member->user_image)) {
+                $member->user_image = Storage::disk('public')->url('uploads/' . $member->user_image);
+            }
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'data'   => $members,
+        ], 200);
+    } catch (Exception $e) {
+        return response()->json([
+            'status'  => 'error',
+            'message' => $e->getMessage(),
+        ], 500);
     }
+}
+
     public function getAllFollowRequestsOfClub(Request $request, $id){
 
         try{
@@ -993,7 +1113,8 @@ public function viewPigeonPost(Request $request)
         }
     }
 
-    public function getClubDetails(Request $request)
+
+public function getClubDetails(Request $request)
 {
     try {
         $validated = $request->validate([
@@ -1010,18 +1131,18 @@ public function viewPigeonPost(Request $request)
         if (!empty($club->club_image)) {
             $club->club_image = Storage::disk('public')->url('uploads/' . $club->club_image);
         }
-        $president = ClubMembers::join('users', 'club_members.user_id', '=', 'users.id')
-            ->select(
-                'users.name as user_name',
-                'users.profile_image as user_image',
-                'users.email',
-                'club_members.role',
-                'users.created_at as member_since'
-            )
-            ->where('club_members.club_id', $club_id)
-            ->where('club_members.request_approved', true)
-            ->where('club_members.role', 'president')
-            ->first();
+
+        // Fetch the user details for the club's user_id
+        $club_user = User::where('id', $club->user_id)->first();
+        $club_user_image = null;
+        if (!empty($club_user->profile_image)) {
+            $club_user_image = Storage::disk('public')->url('uploads/' . $club_user->profile_image);
+        }
+
+        Log::info('Club Data: ' . json_encode($club));
+        Log::info('Club User Data: ' . json_encode($club_user));
+        Log::info('Club User Image: ' . $club_user_image);
+
         $members = ClubMembers::join('users', 'club_members.user_id', '=', 'users.id')
             ->select(
                 'users.name as user_name',
@@ -1039,9 +1160,9 @@ public function viewPigeonPost(Request $request)
                 $member->user_image = Storage::disk('public')->url('uploads/' . $member->user_image);
             }
         }
-        if (!empty($president) && !empty($president->user_image)) {
-            $president->user_image = Storage::disk('public')->url('uploads/' . $president->user_image);
-        }
+
+        Log::info('Club Members: ' . json_encode($members));
+
         $posts = ClubPost::where('club_id', $club_id)
             ->select('id', 'description', 'image', 'pigeon_name', 'champion_year', 'created_at')
             ->orderBy('created_at', 'desc')
@@ -1051,11 +1172,26 @@ public function viewPigeonPost(Request $request)
                 $post->image = Storage::disk('public')->url('uploads/' . $post->image);
             }
         }
+
+        Log::info('Club Posts: ' . json_encode($posts));
+
         return response()->json([
             'status' => 'success',
             'data' => [
-                'club' => $club,
-                'president' => $president,
+                'club' => [
+                    'id' => $club->id,
+                    'user_id' => $club->user_id,
+                    'club_name' => $club->club_name,
+                    'president_name' => $club->president_name,
+                    'role' => $club->role,
+                    'club_image' => $club->club_image,
+                    'country_flag' => $club->country_flag,
+                    'created_at' => $club->created_at,
+                    'updated_at' => $club->updated_at,
+                    'terms_&_conditions' => $club->{'terms_&_conditions'}, // Retrieve from DB
+                    'joining_fee' => $club->joining_fee,
+                    'profile_image' => $club_user_image,
+                ],
                 'members' => $members,
                 'posts' => $posts,
             ]
@@ -1067,12 +1203,18 @@ public function viewPigeonPost(Request $request)
             'errors' => $e->errors(),
         ], 422);
     } catch (Exception $e) {
+        // Log the exception message
+        Log::error('Error: ' . $e->getMessage());
+
         return response()->json([
             'status' => 'error',
             'message' => $e->getMessage(),
         ], 500);
     }
 }
+
+
+
 
 
 public function assignClubRole(Request $request)
@@ -1287,7 +1429,8 @@ public function getBoosts(Request $request)
                         ->where('boost_end', '>', now()); // Exclude records with approved boost_end
                 });
             })
-            ->with('pigeon') // Include related pigeon details
+            ->with('pigeon') 
+            ->orderByDesc('created_at')
             ->get();
 
         foreach ($boosts as $boost) {
@@ -1343,29 +1486,30 @@ public function approveBoost(Request $request)
             'pigeon_id' => 'required|exists:pigeons,id',
         ]);
 
-        // Get the authenticated user
-        $user = Auth::user();
-
-        // Get the pigeon_id from the validated request
         $pigeonId = $validated['pigeon_id'];
-
-        // Get the current time for boost_start and set boost_end to two days from now
-        $boostStart = now();
         $boostEnd = now()->addDays(2);
 
-        // Update the existing boost record for the pigeon with the new boost_end date
-        $boost = Boost::where('pigeon_id', $pigeonId)->whereIn('user_id', [58, 59])->first();
+        // Step 1: Find and update the boost for user 58 or 59
+        $boost = Boost::where('pigeon_id', $pigeonId)
+            ->whereIn('user_id', [58, 59])
+            ->first();
 
         if (!$boost) {
             return response()->json(['message' => 'Boost record not found for the pigeon'], 404);
         }
 
-        // Update the boost's boost_end to two days from now
         $boost->boost_end = $boostEnd;
         $boost->save();
 
+        // Step 2: Delete all other boosts for this pigeon_id except user_id 58 and 59
+        Boost::where('pigeon_id', $pigeonId)
+            ->delete();
+
+        // Step 3: Update created_at for visibility purposes
+        Pigeons::where('id', $pigeonId)->update(['created_at' => now()]);
+
         return response()->json([
-            'message' => 'Pigeon boost approved and moved to the top for two days!',
+            'message' => 'Pigeon boost approved.',
             'status' => 'success',
         ], 200);
 
@@ -1375,6 +1519,8 @@ public function approveBoost(Request $request)
         return response()->json(['error' => 'An unexpected error occurred: ' . $e->getMessage()], 500);
     }
 }
+
+
 
 
 public function reportPost(Request $request)
@@ -1411,6 +1557,7 @@ public function reportPost(Request $request)
     }
 }
 
+
 public function getReports(Request $request)
 {
     try {
@@ -1418,28 +1565,40 @@ public function getReports(Request $request)
             'email' => 'required|email|exists:users,email',
         ]);
 
-        $user = User::where('email', $validated['email'])->first(); // Fetch the user by email
+        $user = User::where('email', $validated['email'])->first();
 
         $reports = Report::where('user_id', $user->id)
-            ->with('pigeon') // Include related pigeon details
+            ->with('pigeon')
+            ->orderByDesc('created_at')
             ->get();
 
         foreach ($reports as $report) {
-            // Ensure pigeon relationship exists
             if (!empty($report->pigeon) && !empty($report->pigeon->images)) {
-                // Decode the JSON string stored in the 'images' column of the pigeons table
-                $decodedImages = json_decode($report->pigeon->images, true);
+                $images = $report->pigeon->images;
 
-                // Check if decoding was successful and is an array
+                // Decode if JSON string, use directly if array
+                if (is_string($images)) {
+                    $decodedImages = json_decode($images, true);
+                } elseif (is_array($images)) {
+                    $decodedImages = $images;
+                } else {
+                    $decodedImages = [];
+                }
+
+                // Make sure it's an array of image paths/URLs
                 if (is_array($decodedImages)) {
                     $report->pigeon->images = array_map(function ($image) {
-                        return url('storage/uploads/' . $image); // Generate full URLs for each image
+                        // Check if it's already a full URL
+                        if (filter_var($image, FILTER_VALIDATE_URL)) {
+                            return $image;
+                        }
+                        return url('storage/uploads/' . ltrim($image, '/'));
                     }, $decodedImages);
                 } else {
-                    $report->pigeon->images = []; // If decoding fails, set to an empty array
+                    $report->pigeon->images = [];
                 }
             } else {
-                $report->pigeon->images = []; // If no images, set to an empty array
+                $report->pigeon->images = [];
             }
         }
 
@@ -1447,6 +1606,7 @@ public function getReports(Request $request)
             'status' => 'success',
             'reports' => $reports,
         ], 200);
+
     } catch (\Illuminate\Validation\ValidationException $e) {
         return response()->json([
             'message' => 'Validation error',
@@ -1459,7 +1619,6 @@ public function getReports(Request $request)
         ], 500);
     }
 }
-
 
 
 
@@ -1577,20 +1736,22 @@ public function getWalkingUserProfileView(Request $request)
         // Fetch club details for the user
         $clubs = Clubs::whereIn('id', $clubIds)->get();
 
-        // Add hardcoded fields to each club
+        // Fetch user's club score dynamically
+        $clubScore = (int) ClubScore::where('user_id', $userId)->sum('club_score');
+
+        // Add fields to each club (keeping hardcoded values for club_score in club)
         $clubs = $clubs->map(function ($club) {
-            $club->club_score = 15;
+            $club->club_score = 15; // Keep club score hardcoded to 15
             $club->club_rank = 15;
             $club->rating = 4;
-            
-          if (!empty($club->club_image)) {
-        // Fetch the full URL for the club image
-        $club->club_image = Storage::disk('public')->url('uploads/' . $club->club_image);
-    }
+
+            if (!empty($club->club_image)) {
+                // Fetch the full URL for the club image
+                $club->club_image = Storage::disk('public')->url('uploads/' . $club->club_image);
+            }
 
             return $club;
         });
-        
 
         // Structure the response data
         $data = [
@@ -1600,6 +1761,7 @@ public function getWalkingUserProfileView(Request $request)
             'address' => $user->address,
             'followers' => $followersCount,
             'following' => $followingCount,
+            'club_score' => $clubScore,
             'post' => $pigeons,
             'shop' => $shops,
             'club' => $clubs,
@@ -1615,6 +1777,8 @@ public function getWalkingUserProfileView(Request $request)
         return response()->json(['error' => 'An unexpected error occurred. Please try again later.'], 500);
     }
 }
+
+
 
 public function viewsOnArticle(Request $request)
 {
@@ -1675,6 +1839,8 @@ public function viewsOnArticle(Request $request)
         ], 500);
     }
 }
+
+
 public function likesOnArticle(Request $request)
 {
     try {
@@ -1778,42 +1944,69 @@ public function likesOnArticle(Request $request)
 
 
 //$user = Auth::user(); $user->id,
-public function sendMessage(Request $request)
-{
-    try {
-        $request->validate([
-            'message' => 'required|string|max:1000',
-        ]);
-
-        // Save message
-        $message = Message::create([
-            'sender_id' => Auth::id(),
-            'message' => $request->message,
-        ]);
-
-        // Check if message was created
-        \Log::info('Message created successfully:', ['message' => $message]);
-
-        // Broadcast to Reverb channel
-        broadcast(new \App\Events\NewMessage($message));
-
-        return response()->json(['message' => 'Message sent successfully','status'=>'success'], 200);
-    } catch (\Exception $e) {
-        \Log::error('General error in sendMessage:', ['error' => $e->getMessage()]);
-        return response()->json(['error' => 'Something went wrong!'], 500);
-    }
-}
-
-public function getMessages(Request $request)
+    public function sendMessage(Request $request, AblyService $ablyService)
     {
         try {
-            $messages = Message::select('id', 'sender_id', 'club_id', 'message', 'image', 'voice_messages', 'videos', 'created_at')
+            $request->validate([
+                'club_id' => 'required|exists:clubs,id',
+                'message' => 'nullable|string|max:1000',
+                'image' => 'nullable|string',
+                'voice_message' => 'nullable|string',
+                'video' => 'nullable|string',
+            ]);
+
+            $messageData = [
+                'sender_id' => Auth::id(),
+                'club_id' => $request->club_id,
+                'message' => $request->message,
+            ];
+
+            if ($request->image) {
+                $imageData = base64_decode($request->image);
+                $fileName = time() . '.png';
+                Storage::disk('public')->put('uploads/' . $fileName, $imageData);
+                $messageData['image'] = $fileName; 
+            }
+
+            if ($request->voice_message) {
+                $voiceMessageData = base64_decode($request->voice_message);
+                $fileName = time() . '.mp3';
+                Storage::disk('public')->put('uploads/' . $fileName, $voiceMessageData);
+                $messageData['voice_message'] = $fileName; 
+            }
+
+            if ($request->video) {
+                $videoData = base64_decode($request->video);
+                $fileName = time() . '.mp4';
+                Storage::disk('public')->put('uploads/' . $fileName, $videoData);
+                $messageData['video'] = $fileName; 
+            }
+
+            $message = Message::create($messageData); 
+
+            \Log::info('Message created successfully:', ['message' => $message]);
+
+            $channelName = 'club-' . $request->club_id;
+            $ablyService->publish($channelName, $message); 
+
+            return response()->json(['status' => 'success', 'message' => 'Message sent successfully'], 200);
+
+        } catch (Throwable $e) {
+            \Log::error('Error in sendMessage:', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
+            return response()->json(['error' => 'Something went wrong!'], 500);
+        }
+    }
+    
+    public function getMessages(Request $request)
+{
+    try {
+        $messages = Message::select('id', 'sender_id', 'club_id', 'message', 'image', 'voice_messages', 'videos', 'created_at')
             ->with(['sender' => function ($query) {
                 $query->select('id', 'name', 'profile_image');
             }])
             ->where('club_id', $request->club_id)
+            ->where('created_at', '>=', now()->subDays(30)) // Fetch messages from the last 30 days
             ->latest()
-            ->take(50)
             ->get();
 
         $messages = $messages->map(function ($message) {
@@ -1832,36 +2025,26 @@ public function getMessages(Request $request)
                     : null,
             ];
         });
-            return response()->json(['status' => 'success','data' => $messages ], 200);
-        } catch (\Exception $e) {
-            \Log::error('Error fetching messages:', ['error' => $e->getMessage()]);
-            return response()->json(['error' => 'Something went wrong while fetching messages!'], 500);
-        }
-    }
 
+        return response()->json(['status' => 'success', 'data' => $messages], 200);
+    } catch (\Exception $e) {
+        \Log::error('Error fetching messages:', ['error' => $e->getMessage()]);
+        return response()->json(['error' => 'Something went wrong while fetching messages!'], 500);
+    }
+}
 
 
 public function deletePigeon(Request $request)
     {
-        // Retrieve pigeon_id from query params
         $pigeon_id = $request->query('pigeon_id');
-
-        // Check if pigeon_id is provided
         if (!$pigeon_id) {
             return response()->json(['message' => 'pigeon_id is required'], 400);
         }
-
-        // Find the pigeon by ID
         $pigeon = Pigeons::find($pigeon_id);
-
-        // Check if the pigeon exists
         if (!$pigeon) {
             return response()->json(['message' => 'Pigeon not found'], 404);
         }
-
-        // Delete the pigeon
         $pigeon->delete();
-
         return response()->json(['message' => 'Pigeon deleted successfully'], 200);
     }
 
@@ -1898,56 +2081,68 @@ public function deletePigeon(Request $request)
         }
     }
     
-    public function markAsRead(Request $request)
-    {
-        try {
-            $user = $request->user(); // Get authenticated user
-    
-            // Validate the request
-            $validatedData = $request->validate([
-                'id' => 'required|exists:notifications,id',
-                'is_read' => 'required|boolean',
-            ]);
-            $notification = Notification::where('id', $request->query('id'))
-                                        ->where('user_id', $user->id)
-                                        ->firstOrFail();
-            $notification->is_read = $validatedData['is_read'];
-            $notification->save();
-            return response()->json([
-                'status' => 'success',
-                'message' => 'Notification read status updated successfully.',
-            ], 200);
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to update notification read status.',
-                'error' => $e->getMessage(),
-            ], 500);
-        }
+   public function markAsRead(Request $request)
+{
+    try {
+        // Validate the request data
+        $validatedData = $request->validate([
+            'id' => 'required|exists:notifications,id', // Validate the notification ID
+            'is_read' => 'required|boolean', // Validate is_read value (0 or 1)
+        ]);
+
+        // Find the notification by ID
+        $notification = Notification::where('id', $validatedData['id'])->firstOrFail();
+
+        // Update the notification's read status
+        $notification->is_read = $validatedData['is_read'];
+        $notification->save();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Notification read status updated successfully.',
+        ], 200);
+    } catch (\Exception $e) {
+        return response()->json([
+            'status' => 'error',
+            'message' => 'Failed to update notification read status.',
+            'error' => $e->getMessage(),
+        ], 500);
     }
-    
-    public function getUnreadNotifications(Request $request)
-    {
-        try {
-            $user = $request->user(); 
-            $unreadNotifications = Notification::where('user_id', $user->id)
-                                               ->where('is_read', 0)
-                                               ->get();
-    
-            return response()->json([
-                'status' => 'success',
-                'message' => 'Unread notifications retrieved successfully.',
-                'data' => $unreadNotifications,
-            ], 200);
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to retrieve unread notifications.',
-                'error' => $e->getMessage(),
-            ], 500);
-        }
+}
+
+
+
+public function getUnreadNotifications(Request $request)
+{
+    try {
+        // Fetch all unread notifications (is_read = 0)
+        $unreadNotifications = Notification::where('is_read', 0) 
+                                ->orderByDesc('created_at')
+                                           ->get();
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Unread notifications retrieved successfully.',
+            'data' => $unreadNotifications,
+        ], 200);
+    } catch (\Exception $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to retrieve unread notifications.',
+            'error' => $e->getMessage(),
+        ], 500);
     }
-   
+}
+    
+    public function getPigeonNames()
+{
+    try {
+        $pigeons = DB::table('PigeonNames')->get();
+        return response()->json(['status' => 'success', 'data' => $pigeons], 200);
+    } catch (\Exception $e) {
+        return response()->json(['status' => false, 'message' => $e->getMessage()], 500);
+    }
+}
+
     public function addClubScore(Request $request)
 {
     try {
@@ -1964,8 +2159,8 @@ public function deletePigeon(Request $request)
         ]);
 
         return response()->json([
+            'status'=>'success',
             'message' => 'Club score added successfully',
-            'data' => $clubScore
         ], 200);
     } catch (\Exception $e) {
         return response()->json([
@@ -1974,6 +2169,95 @@ public function deletePigeon(Request $request)
         ], 500);
     }
 }
+
+public function deleteUser(Request $request)
+{
+    try {
+        $user = auth()->user(); 
+        
+        if (!$user) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'User not found.'
+            ], 404);
+        }
+
+        $user->tokens()->delete(); 
+        $user->delete(); 
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'User deleted successfully.'
+        ], 200);
+    } catch (\Exception $e) {
+        return response()->json([
+            'status' => 'error',
+            'message' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+public function updateProfileImage(Request $request) {
+    try {
+        $user = auth()->user(); // Get the authenticated user
+
+        $validator = Validator::make($request->all(), [
+            'profile_image' => 'required',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => 'error',
+                'message' => $validator->errors()->first(),
+            ], 400);
+        }
+
+        $fileName = "";
+        if ($request->has('profile_image')) {
+            $file = base64_decode($request->profile_image);
+            $fileName = time() . '.png';
+            Storage::disk('public')->put('uploads/' . $fileName, $file);
+
+            if (!empty($user->profile_image) && Storage::disk('public')->exists('uploads/' . $user->profile_image)) {
+                Storage::disk('public')->delete('uploads/' . $user->profile_image);
+            }
+
+            $user->update(['profile_image' => $fileName]);
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Profile image updated successfully!',
+        ], 200);
+    } catch (Exception $e) {
+        return response()->json([
+            'status' => 'error',
+            'message' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+public function getUserNames()
+{
+    try {
+        $users = User::select('id', 'name')->get();
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $users, 
+        ], 200);
+    } catch (Exception $e) {
+        return response()->json([
+            'status' => 'error',
+            'message' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+
+
+
+
 
 
 }
