@@ -56,13 +56,17 @@ class APIController extends Controller
     try {
         $user = User::where('email', $request['email'])->firstOrFail();
 
-        // Generate token
-        $token = $user->createToken('auth_token')->plainTextToken;
+        // ✅ Check if email is verified
+        if (!$user->email_verified_at) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Email not verified. Please verify your email before logging in.'
+            ], 403);
+        }
 
-        // Generate URL for profile image using Storage facade
+        $token = $user->createToken('auth_token')->plainTextToken;
         $profileImageUrl = Storage::disk('public')->url('uploads/' . $user->profile_image);
 
-        // Return response with user ID, profile image URL, and token
         return response()->json([
             'status' => 'success',
             'user_id' => $user->id,
@@ -70,6 +74,7 @@ class APIController extends Controller
             'access_token' => $token,
             'token_type' => 'Bearer',
         ]);
+
     } catch (Exception $e) {
         return response()->json([
             'status' => 'error',
@@ -127,7 +132,7 @@ class APIController extends Controller
         }
     }
     
-    public function generateOtp(Request $request)
+public function generateOtp(Request $request)
 {
     try {
         // Validate the request
@@ -164,6 +169,7 @@ class APIController extends Controller
         return response()->json(['error' => 'Failed to generate OTP', 'message' => $e->getMessage()], 500);
     }
 }
+
 
     public function resetPasswordWithOtp(Request $request)
     {
@@ -2254,6 +2260,43 @@ public function getUserNames()
     }
 }
 
+
+public function verifyOtp(Request $request)
+{
+    try {
+        $validator = Validator::make($request->all(), [
+            'email' => 'required|email|exists:users,email',
+            'otp' => 'required|digits:6',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['status' => 'error', 'errors' => $validator->errors()], 400);
+        }
+
+        $record = DB::table('password_resets')
+            ->where('email', $request->email)
+            ->where('otp', $request->otp)
+            ->where('expires_at', '>', Carbon::now())
+            ->first();
+
+        if (!$record) {
+            return response()->json(['status' => 'error', 'message' => 'Invalid or expired OTP'], 400);
+        }
+
+        // Update the user's email_verified_at field
+        User::where('email', $request->email)->update([
+            'email_verified_at' => Carbon::now(),
+        ]);
+
+        // Optionally delete the OTP
+        DB::table('password_resets')->where('email', $request->email)->delete();
+
+        return response()->json(['status' => 'success', 'message' => 'OTP verified, email verified successfully'], 200);
+
+    } catch (Exception $e) {
+        return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+    }
+}
 
 
 
