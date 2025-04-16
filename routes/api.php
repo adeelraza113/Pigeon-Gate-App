@@ -12,6 +12,7 @@ use Ably\AblyRest;
 Route::post('/register', [APIController::class, 'register']);
 Route::post('/login', [APIController::class, 'login']);
 Route::post('/generate-otp', [APIController::class, 'generateOtp']);
+Route::post('/verify-otp', [APIController::class, 'verifyOtp']);
 Route::post('/reset-password-with-otp', [APIController::class, 'resetPasswordWithOtp']);
 
 
