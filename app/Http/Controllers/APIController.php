@@ -218,18 +218,25 @@ public function generateOtp(Request $request)
                 'users.phone as user_phone'
             );
 
+        // Search functionality
         if (!empty($search)) {
             $query->where(function ($q) use ($search) {
                 $terms = explode('&', $search); // Split search terms by '&'
                 foreach ($terms as $term) {
-                    $trimmedTerm = trim($term); // Trim spaces around the term
+                    $trimmedTerm = trim($term);
                     $q->orWhere('pigeons.name', 'LIKE', '%' . $trimmedTerm . '%')
                       ->orWhere('users.name', 'LIKE', '%' . $trimmedTerm . '%');
                 }
             });
         }
 
-        $pigeons = $query->orderBy('pigeons.created_at', 'desc')->get();
+        // Custom ordering: boost-approved & recent pigeons come first
+        $query->orderByRaw("
+            (pigeons.boosts_approved = 1 AND pigeons.created_at >= ?) DESC,
+            pigeons.created_at DESC
+        ", [$thirtyDaysAgo]);
+
+        $pigeons = $query->get();
 
         foreach ($pigeons as $pigeon) {
             // Decode and format pigeon images
@@ -881,7 +888,7 @@ public function viewPigeonPost(Request $request)
         }
 
         $user_detail->posts = Pigeons::where('user_id', $user->id)
-            ->select('name', 'created_at as post_date')
+            ->select('id','name', 'created_at as post_date')
             ->get();
 
         // Fetch user's shops and products
@@ -1511,8 +1518,11 @@ public function approveBoost(Request $request)
         Boost::where('pigeon_id', $pigeonId)
             ->delete();
 
-        // Step 3: Update created_at for visibility purposes
-        Pigeons::where('id', $pigeonId)->update(['created_at' => now()]);
+        // Step 3: Update created_at and set boosts_approved to 1
+        Pigeons::where('id', $pigeonId)->update([
+            'created_at' => now(),
+            'boosts_approved' => 1
+        ]);
 
         return response()->json([
             'message' => 'Pigeon boost approved.',
@@ -2298,6 +2308,77 @@ public function verifyOtp(Request $request)
     }
 }
 
+public function ignoreBoost(Request $request)
+{
+    try {
+        $pigeonId = $request->query('pigeon_id');
+
+        if (!$pigeonId) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'pigeon_id query parameter is required.',
+            ], 400);
+        }
+
+    
+        $pigeonExists = Pigeons::where('id', $pigeonId)->exists();
+        if (!$pigeonExists) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Pigeon not found.',
+            ], 404);
+        }
+
+        Boost::where('pigeon_id', $pigeonId)->delete();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Boosts removed for the pigeon.',
+        ], 200);
+
+    } catch (\Exception $e) {
+        return response()->json([
+            'status' => 'error',
+            'message' => 'An unexpected error occurred: ' . $e->getMessage(),
+        ], 500);
+    }
+}
+
+
+public function ignoreReport(Request $request)
+{
+    try {
+        $pigeonId = $request->query('pigeon_id');
+
+        if (!$pigeonId) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'pigeon_id query parameter is required.',
+            ], 400);
+        }
+
+        $pigeonExists = Pigeons::where('id', $pigeonId)->exists();
+        if (!$pigeonExists) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Pigeon not found.',
+            ], 404);
+        }
+
+        Report::where('pigeon_id', $pigeonId)->delete();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Reports removed for the pigeon.',
+        ], 200);
+
+    } catch (\Exception $e) {
+        return response()->json([
+            'status' => 'error',
+            'message' => 'An unexpected error occurred: ' . $e->getMessage(),
+        ], 500);
+    }
+}
 
 
 

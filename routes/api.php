@@ -23,7 +23,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
    Route::get('/fetch-messages/{channelName}', [APIController::class, 'fetchMessages']);
    Route::delete('/user', [APIController::class, 'deleteUser']);
    Route::put('/update', [APIController::class, 'updateProfileImage']);
-
+   
 
    
     Route::get('/user-profile', [APIController::class, 'getWalkingUserProfileView']);
@@ -36,8 +36,11 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::post('/boost', [APIController::class, 'boostPigeon']);
         Route::get('/boosts', [APIController::class, 'getBoosts']);
         Route::post('approveBoost', [APIController::class, 'approveBoost']);
+        Route::delete('/ignore-boost', [APIController::class, 'ignoreBoost']);
         Route::post('/report', [APIController::class, 'reportPost']);
         Route::get('/reports', [APIController::class, 'getReports']);
+        Route::delete('/ignore-report', [APIController::class, 'ignoreReport']);
+
     });
 
     Route::group(['as' => "shop-", 'prefix' => 'shop'], function () {
